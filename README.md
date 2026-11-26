@@ -13,13 +13,21 @@ Depuis la 1.3.0, la carte peut aussi faire **sa propre recherche** à partir d�
 
 ## Installation
 
-### Via HACS (recommandé)
+L’installation complète, intégration comprise, est décrite pas à pas dans le [README de l’intégration](https://github.com/Laurent14760/HomeAssistant_DonduSang#2-installation-pas-%C3%A0-pas) (exemple : Bretteville-sur-Odon, 10 km, 30 jours), avec des propositions de cartes prêtes à coller (chapitre 5).
 
-1. HACS → ⋮ → **Dépôts personnalisés**.
-2. URL : `https://github.com/Laurent14760/HomeAssistant_DonduSang_Card`, catégorie **Tableau de bord** (*Dashboard*), puis **Ajouter**.
-3. Rechercher « EFS – Carte des collectes de don du sang » dans HACS, **Télécharger**.
-4. HACS déclare lui-même la ressource du tableau de bord. Rechargez la page du navigateur (Ctrl + Maj + R).
-   Dans l’application mobile : Paramètres → Application compagnon → Dépannage (ou Débogage) → **Réinitialiser le cache du frontend**, puis fermez complètement l’application et rouvrez-la.
+### Via le Marketplace de Home Assistant (2026.11 et plus, recommandé)
+
+1. Installer d’abord l’intégration **HomeAssistant_DonduSang** (1.4.1 ou plus) et créer au moins une instance.
+2. **Paramètres → Marketplace → ⋮ → Add from link** (« Ajouter depuis un lien »). Un compte GitHub doit être relié au Marketplace pour ajouter un dépôt hors catalogue.
+3. URL : `https://github.com/Laurent14760/HomeAssistant_DonduSang_Card` ; si une catégorie est demandée : **Tableau de bord** (*Dashboard*).
+4. Ouvrir la fiche « EFS – Carte des collectes de don du sang », puis **Install**.
+5. Le Marketplace déclare lui-même la ressource du tableau de bord ; aucun redémarrage n’est nécessaire. Recharger la page du navigateur (Ctrl + Maj + R).
+   Dans l’application mobile : Paramètres → Application compagnon → Dépannage (ou Débogage) → **Réinitialiser le cache du frontend**, puis fermer complètement l’application et la rouvrir.
+6. Mises à jour : **Paramètres → Mises à jour** ; pour une release publiée à l’instant, fiche du dépôt → ⋮ → **Refresh information**. Vider le cache du navigateur après chaque mise à jour.
+
+### Home Assistant antérieur à 2026.11 (HACS)
+
+HACS → ⋮ → **Dépôts personnalisés**, même URL, catégorie **Tableau de bord**, puis **Télécharger**. À la mise à niveau vers 2026.11, le Marketplace reprend le dépôt et ses mises à jour sans réinstallation.
 
 ### Manuelle
 
@@ -167,11 +175,11 @@ cards:
 
 | Symptôme | Cause et solution |
 |---|---|
-| « Custom element doesn’t exist: efs-collectes-card » | La ressource n’est pas chargée, presque toujours à cause du cache. Navigateur : Ctrl + Maj + R. Application mobile : réinitialiser le cache du frontend **et** forcer l’arrêt de l’application. |
+| « Custom element doesn’t exist: efs-collectes-card » | La ressource n’est pas chargée, presque toujours à cause du cache (vérifier aussi que la carte est installée dans Paramètres → Marketplace). Navigateur : Ctrl + Maj + R. Application mobile : réinitialiser le cache du frontend **et** forcer l’arrêt de l’application. |
 | « Aucune instance de l’intégration EFS trouvée » | L’intégration n’est pas installée, ou l’entité indiquée n’existe plus (renommée, instance supprimée) : choisir l’instance dans l’éditeur. |
-| « Recherche indisponible : mettez l’intégration EFS en version 1.4.0 ou plus » | L’action `efs_dondesang.rechercher_collectes` n’existe pas : mettre l’intégration à jour via HACS, redémarrer Home Assistant ; au moins une instance doit être installée. |
+| « Recherche indisponible : mettez l’intégration EFS en version 1.4.0 ou plus » | L’action `efs_dondesang.rechercher_collectes` n’existe pas : mettre l’intégration à jour (Paramètres → Mises à jour), redémarrer Home Assistant ; au moins une instance doit être installée. |
 | « Recherche impossible : Aucune commune trouvée pour le code postal … » | Code postal inconnu de l’API Géo : vérifier la saisie. |
-| « Plan indisponible : mettez l’intégration à jour » | L’intégration est antérieure à la 1.1.0 ; la mettre à jour via HACS puis redémarrer Home Assistant. |
+| « Plan indisponible : mettez l’intégration à jour » | L’intégration est antérieure à la 1.1.0 ; la mettre à jour (Paramètres → Mises à jour) puis redémarrer Home Assistant. |
 | Deux versions de la carte coexistent | L’intégration 1.1.0 embarquait elle aussi la carte. Mettre l’intégration en 1.2.0 ou plus, qui ne l’embarque plus, et supprimer toute ressource pointant vers `/efs_dondesang/efs-collectes-card.js`. |
 
 ## Licence
