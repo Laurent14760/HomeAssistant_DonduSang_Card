@@ -2,19 +2,30 @@
  * efs-collectes-card – carte Lovelace pour l’intégration efs_dondesang (dépôt HomeAssistant_DonduSang_Card).
  * Trois vues (synthèse, agenda, carte + remplissage), entièrement paramétrables depuis l’éditeur visuel.
  *
+ * Deux sources de données :
+ *  - une instance de l'intégration (entité choisie, réglages de l'instance) ;
+ *  - une recherche propre à la carte, dès qu'un code postal est indiqué (action
+ *    efs_dondesang.rechercher_collectes, intégration 1.4.0 ou plus).
+ *
  *   type: custom:efs-collectes-card
  *   entity: sensor.efs_caen_collectes_a_venir   # n'importe quelle entité de l'instance (défaut : 1re instance)
+ *   # --- recherche propre à la carte (remplace l'instance) ---
+ *   code_postal: "14760"   commune_depart: Bretteville-sur-Odon   # commune : si le code postal en couvre plusieurs
+ *   rayon_km: 10           type_don: sang | plasma | plaquettes
+ *   jours: 30              # recherche : nombre de jours couverts ; instance : filtre sur l'horizon
+ *   inclure_professionnelles: false   actualisation: 30 (minutes)
+ *   afficher_formulaire: true          # champs de recherche modifiables directement dans la carte
  *   vue: synthese | agenda | carte | complet
  *   commune: CAEN        # synthèse : prochaine collecte dans cette commune (défaut : auto = la plus proche dans le temps)
  *   titre: "Don du sang – Caen"
  *   filtre: toutes | rdv_ouverts
- *   jours: 30            distance_max: 5          max: 6
+ *   distance_max: 5      max: 6
  *   couleur: "#B42318"  (ou [180, 35, 24])
  *   afficher_entete / afficher_adresse / afficher_boutons / afficher_pied /
  *   afficher_plan / afficher_jauge / afficher_remplissage : true | false
  */
 (() => {
-  const VERSION = "1.2.1";
+  const VERSION = "1.3.0";
   const DOMAIN = "efs_dondesang";
   const TZ_FALLBACK = "Europe/Paris";
   const DON = { sang: "Sang total", plasma: "Plasma", plaquettes: "Plaquettes" };
@@ -25,7 +36,22 @@
     "afficher_plan", "afficher_jauge", "afficher_remplissage",
   ];
   const COMMUNE_AUTO = "auto";
-  const DEFAULTS = { vue: "complet", commune: COMMUNE_AUTO, max: 6, filtre: "toutes", ...Object.fromEntries(AFFICHAGES.map((k) => [k, true])) };
+  const DEFAULTS = {
+    vue: "complet", commune: COMMUNE_AUTO, max: 6, filtre: "toutes",
+    ...Object.fromEntries(AFFICHAGES.map((k) => [k, true])),
+    // Recherche propre à la carte (utilisée seulement si un code postal est indiqué
+    // ou si le formulaire est affiché)
+    rayon_km: 10, type_don: "sang", inclure_professionnelles: false, afficher_formulaire: false, actualisation: 30,
+  };
+  const SERVICE = "rechercher_collectes";
+  const JOURS_RECHERCHE = 30;       // nombre de jours par défaut d'une recherche
+  const MAX_RECHERCHE = 50;         // collectes demandées (la vue synthèse peut viser une commune lointaine)
+  const BORNES = { rayon_km: [1, 50], jours: [1, 180] };
+  const CP_RE = /^\d{5}$/;
+  const borne = (v, [min, max], def) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? Math.max(min, Math.min(max, Math.round(n))) : def;
+  };
 
   const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -162,6 +188,15 @@
     .fill .bar{height:8px}
     .empty{color:var(--efs-muted);text-align:center;padding:12px}
     .warn{font-size:12px;color:var(--efs-muted)}
+    form.search{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px;align-items:end;padding:12px;background:var(--efs-soft);border-radius:12px}
+    form.search label{display:flex;flex-direction:column;gap:4px;font-size:12px;font-weight:600;color:var(--efs-muted)}
+    form.search input,form.search select{font:inherit;font-size:15px;color:var(--efs-text);background:var(--ha-card-background,var(--card-background-color,#fff));border:1px solid var(--efs-line);border-radius:8px;padding:8px 10px;min-height:40px;box-sizing:border-box;width:100%}
+    form.search input[aria-invalid="true"]{border-color:var(--efs-accent)}
+    form.search button{min-height:40px;border:0;border-radius:8px;background:var(--efs-accent);color:#fff;font:inherit;font-size:15px;font-weight:600;cursor:pointer}
+    form.search button:disabled{opacity:.6;cursor:progress}
+    form.search .full{grid-column:1/-1}
+    .status{font-size:12px;color:var(--efs-muted)}
+    .status.err{color:var(--efs-accent-text)}
   `;
 
   class EfsCollectesCard extends HTMLElement {
@@ -176,15 +211,38 @@
 
     setConfig(config) {
       if (config.vue && !VUES.includes(config.vue)) throw new Error(`vue doit valoir : ${VUES.join(", ")}`);
+      if (config.type_don && !(config.type_don in DON)) throw new Error(`type_don doit valoir : ${Object.keys(DON).join(", ")}`);
       this._config = { ...DEFAULTS, ...config };
       this._ids = null;
       if (!this.shadowRoot) this.attachShadow({ mode: "open" });
       this._sig = null;
+      this._formSig = null;
+      // Paramètres de recherche : ceux de la configuration, que le formulaire peut ensuite modifier.
+      const params = this._paramsFromConfig();
+      if (JSON.stringify(params) !== JSON.stringify(this._cfgParams)) {
+        this._cfgParams = params;
+        this._params = { ...params };
+        this._res = null;
+        this._err = null;
+        this._scheduleSearch(0);
+      }
+      this._startTimer();
       if (this._hass) this._render();
     }
 
     set hass(hass) {
+      const first = !this._hass;
       this._hass = hass;
+      if (this._isSearch()) {
+        // En mode recherche, les états des entités n'influencent pas l'affichage.
+        if (first) this._scheduleSearch(0);
+        const sig = `R|${new Date().getDate()}|${hass.themes?.darkMode}`;
+        if (sig !== this._sig) {
+          this._sig = sig;
+          this._render();
+        }
+        return;
+      }
       if (!this._ids || this._entsRef !== hass.entities) {
         this._ids = resolveInstance(hass, this._config || {});
         this._entsRef = hass.entities;
@@ -196,6 +254,152 @@
         this._sig = sig;
         this._render();
       }
+    }
+
+    connectedCallback() {
+      this._startTimer();
+      // Retour sur l'onglet après une longue absence : données relancées si périmées.
+      if (this._isSearch() && this._res && Date.now() - (this._resAt || 0) > this._periode()) this._scheduleSearch(0);
+    }
+
+    disconnectedCallback() {
+      clearInterval(this._timer);
+      this._timer = null;
+      clearTimeout(this._debounce);
+    }
+
+    // ------------------------------------------------------------- recherche
+    /** Mode recherche : un code postal est configuré, ou le formulaire est affiché. */
+    _isSearch() {
+      const c = this._config || {};
+      return Boolean(c.code_postal || c.afficher_formulaire);
+    }
+
+    _paramsFromConfig() {
+      const c = this._config;
+      return {
+        // Un code postal écrit sans guillemets en YAML (01000) arrive sous forme de nombre (1000).
+        code_postal: typeof c.code_postal === "number" ? String(c.code_postal).padStart(5, "0") : String(c.code_postal ?? "").replace(/\s/g, ""),
+        commune: c.commune_depart || "",
+        rayon_km: borne(c.rayon_km, BORNES.rayon_km, DEFAULTS.rayon_km),
+        type_don: c.type_don in DON ? c.type_don : DEFAULTS.type_don,
+        jours: borne(c.jours, BORNES.jours, JOURS_RECHERCHE),
+        inclure_professionnelles: Boolean(c.inclure_professionnelles),
+      };
+    }
+
+    _periode() {
+      return Math.max(5, Number(this._config?.actualisation) || DEFAULTS.actualisation) * 60e3;
+    }
+
+    _startTimer() {
+      clearInterval(this._timer);
+      this._timer = null;
+      if (!this._isSearch() || !this.isConnected) return;
+      this._timer = setInterval(() => this._search(), this._periode());
+    }
+
+    _scheduleSearch(delay = 400) {
+      if (!this._isSearch()) return;
+      clearTimeout(this._debounce);
+      this._debounce = setTimeout(() => this._search(), delay);
+    }
+
+    async _search() {
+      const p = this._params;
+      if (!this._hass || !p || !CP_RE.test(p.code_postal)) {
+        if (this._hass) this._render();
+        return;
+      }
+      const seq = (this._seq = (this._seq || 0) + 1);
+      this._loading = true;
+      this._render();
+      const data = {
+        code_postal: p.code_postal,
+        rayon_km: p.rayon_km,
+        type_don: p.type_don,
+        jours: p.jours,
+        inclure_professionnelles: p.inclure_professionnelles,
+        max_collectes: MAX_RECHERCHE,
+      };
+      if (p.commune) data.commune = p.commune;
+      try {
+        const res = await this._hass.callWS({
+          type: "call_service", domain: DOMAIN, service: SERVICE, service_data: data, return_response: true,
+        });
+        if (seq !== this._seq) return; // une recherche plus récente a été lancée
+        this._res = res?.response || null;
+        this._resAt = Date.now();
+        this._err = null;
+        // La commune retenue devient le choix courant (liste déroulante du formulaire).
+        if (this._res?.centre?.code_insee && (this._res.communes || []).length > 1) {
+          this._params.commune = this._res.centre.code_insee;
+        }
+      } catch (e) {
+        if (seq !== this._seq) return;
+        this._res = null; // pas de résultats d'une recherche précédente sous le message d'erreur
+        const code = e?.code || e?.error?.code;
+        this._err = code === "service_not_found" || code === "not_found"
+          ? "Recherche indisponible : mettez l’intégration EFS en version 1.4.0 ou plus (au moins une instance installée), puis redémarrez Home Assistant."
+          : `Recherche impossible : ${e?.message || e?.error?.message || e}`;
+      } finally {
+        if (seq === this._seq) {
+          this._loading = false;
+          this._render();
+        }
+      }
+    }
+
+    /** Formulaire de recherche affiché en tête de carte (afficher_formulaire: true). */
+    _formHtml() {
+      const p = this._params;
+      const communes = this._res?.centre?.code_postal === p.code_postal ? this._res.communes || [] : [];
+      const opt = (v, l, sel) => `<option value="${esc(v)}"${sel ? " selected" : ""}>${esc(l)}</option>`;
+      const choixCommune = communes.length > 1
+        ? `<label class="full">Commune de départ<select name="commune">${communes.map((c) =>
+            opt(c.code, c.nom, c.code === p.commune || cle(c.nom) === cle(p.commune))).join("")}</select></label>`
+        : "";
+      const invalide = p.code_postal && !CP_RE.test(p.code_postal);
+      return `<form class="search" novalidate>
+        <label>Code postal<input name="code_postal" inputmode="numeric" autocomplete="postal-code" maxlength="5" placeholder="14000"
+          value="${esc(p.code_postal)}" aria-invalid="${invalide}"></label>
+        <label>Rayon (km)<input name="rayon_km" type="number" min="${BORNES.rayon_km[0]}" max="${BORNES.rayon_km[1]}" value="${esc(p.rayon_km)}"></label>
+        <label>Type de collecte<select name="type_don">${Object.entries(DON).map(([k, l]) => opt(k, l, k === p.type_don)).join("")}</select></label>
+        <label>Jours<input name="jours" type="number" min="${BORNES.jours[0]}" max="${BORNES.jours[1]}" value="${esc(p.jours)}"></label>
+        <button type="submit"${this._loading ? " disabled" : ""}>${this._loading ? "Recherche…" : "Rechercher"}</button>
+        ${choixCommune}
+      </form>`;
+    }
+
+    _bindForm(form) {
+      const lire = () => {
+        const v = Object.fromEntries(new FormData(form).entries());
+        const cp = String(v.code_postal || "").replace(/\s/g, "");
+        const autreCp = cp !== this._params.code_postal;
+        this._params = {
+          ...this._params,
+          code_postal: cp,
+          // Nouveau code postal : la commune précédente ne s'y applique plus.
+          commune: autreCp ? "" : v.commune ?? this._params.commune,
+          rayon_km: borne(v.rayon_km, BORNES.rayon_km, this._params.rayon_km),
+          type_don: v.type_don in DON ? v.type_don : this._params.type_don,
+          jours: borne(v.jours, BORNES.jours, this._params.jours),
+        };
+        form.code_postal.setAttribute("aria-invalid", String(Boolean(cp) && !CP_RE.test(cp)));
+        return CP_RE.test(cp);
+      };
+      form.addEventListener("submit", (ev) => {
+        ev.preventDefault();
+        if (lire()) this._scheduleSearch(0);
+        else this._render();
+      });
+      // Listes déroulantes et champs numériques : recherche dès la validation du champ.
+      // Sortie d'un champ : on rattrape un rafraîchissement du formulaire différé pendant la saisie.
+      form.addEventListener("focusout", () => setTimeout(() => this._render(), 0));
+      form.addEventListener("change", (ev) => {
+        if (ev.target.name === "code_postal" && !CP_RE.test(ev.target.value.replace(/\s/g, ""))) return;
+        if (lire()) this._scheduleSearch(250);
+      });
     }
 
     getCardSize() {
@@ -211,10 +415,20 @@
       const hass = this._hass;
       const cfg = this._config;
       const tz = hass.config?.time_zone || TZ_FALLBACK;
-      const next = hass.states[this._ids.next];
-      const ag = hass.states[this._ids.agenda];
-      const A = next?.attributes || {};
-      const G = ag?.attributes || {};
+      const search = this._isSearch();
+      let next, ag, A, G;
+      if (search) {
+        // Réponse de l'action, au même format que les attributs du capteur « collectes à venir ».
+        G = this._res || {};
+        A = { type_don: G.type_don, derniere_mise_a_jour: G.derniere_mise_a_jour, api_disponible: G.api_disponible };
+        next = ag = this._res ? { attributes: G } : null;
+      } else {
+        if (!this._ids) this._ids = resolveInstance(hass, cfg);
+        next = hass.states[this._ids.next];
+        ag = hass.states[this._ids.agenda];
+        A = next?.attributes || {};
+        G = ag?.attributes || {};
+      }
       const now = Date.now();
       const toutes = (G.collectes || []).map((c) => {
         const restantes = num(c.places_restantes);
@@ -229,13 +443,20 @@
           statut: c.statut || statutDe(restantes),
         };
       });
-      const jours = num(cfg.jours);
+      // En recherche, le nombre de jours est déjà appliqué par l'intégration.
+      const jours = search ? null : num(cfg.jours);
       const dmax = num(cfg.distance_max);
       const list = toutes.filter((c) =>
         (cfg.filtre !== "rdv_ouverts" || c.statut === ST.OUVERT)
         && (!jours || c.debutDate - now <= jours * 864e5)
         && (!dmax || c.distance === null || c.distance <= dmax));
-      return { tz, next, ag, A, G, list, toutes, filtre_actif: list.length !== toutes.length, rayon: dmax || num(G.rayon_km) || 10 };
+      return {
+        tz, next, ag, A, G, list, toutes, search,
+        total: search ? num(G.nombre) ?? toutes.length : toutes.length,
+        filtre_actif: list.length !== toutes.length,
+        rayon: dmax || num(G.rayon_km) || 10,
+        jours: search ? G.horizon_jours : cfg.jours || G.horizon_jours,
+      };
     }
 
     _fmt(tz) {
@@ -260,7 +481,9 @@
     _vide(d) {
       const c = this._config;
       if (d.filtre_actif) return "Aucune collecte ne correspond aux filtres de la carte.";
-      return `Aucune collecte dans les ${esc(c.jours || d.G.horizon_jours || "")} prochains jours à moins de ${esc(d.rayon)} km.`;
+      const autour = d.search && d.G.centre?.libelle ? ` de ${esc(titre(d.G.centre.libelle))}` : "";
+      const type = d.search ? ` (${esc((DON[d.G.type_don] || "").toLowerCase())})` : "";
+      return `Aucune collecte${type} dans les ${esc(d.jours || "")} prochains jours à moins de ${esc(d.rayon)} km${autour}.`;
     }
 
     // -------------------------------------------------------------- rendu
@@ -269,7 +492,14 @@
       const cfg = this._config;
       const d = this._data();
       let body;
-      if (!d.ag) {
+      if (d.search && !d.ag) {
+        const p = this._params || {};
+        body = this._err ? ""
+          : this._loading ? `<div class="empty">Recherche des collectes…</div>`
+          : !p.code_postal ? `<div class="empty">Saisissez un code postal pour rechercher les collectes.</div>`
+          : !CP_RE.test(p.code_postal) ? `<div class="empty">Le code postal doit comporter 5 chiffres.</div>`
+          : `<div class="empty">Recherche des collectes…</div>`;
+      } else if (!d.ag) {
         body = `<div class="empty">Aucune instance de l’intégration EFS trouvée${cfg.entity ? ` pour ${esc(cfg.entity)}` : ""}.<br>Vérifiez que l’intégration est installée, puis choisissez l’instance dans l’éditeur de la carte.</div>`;
       } else {
         const f = this._fmt(d.tz);
@@ -287,7 +517,51 @@
       const accent = couleur(cfg.couleur);
       const classes = [this._hass.themes?.darkMode ? "dark" : "", accent ? "custom" : ""].join(" ").trim();
       const style = accent ? `--efs-accent:${accent};--efs-accent-soft:color-mix(in srgb, ${accent} 16%, transparent);` : "";
-      this.shadowRoot.innerHTML = `<style>${STYLE}</style><ha-card class="${classes}" style="${style}">${head}${body}</ha-card>`;
+
+      // Squelette posé une fois : le formulaire n'est pas redessiné à chaque mise à jour,
+      // pour ne pas perdre la saisie ni le focus.
+      let card = this.shadowRoot.querySelector("ha-card");
+      if (!card) {
+        this.shadowRoot.innerHTML = `<style>${STYLE}</style><ha-card><div id="head"></div><div id="form"></div><div id="status"></div><div id="body"></div></ha-card>`;
+        card = this.shadowRoot.querySelector("ha-card");
+      }
+      card.className = classes;
+      card.setAttribute("style", style);
+      const zone = (id, html) => {
+        const el = card.querySelector(`#${id}`);
+        el.style.display = html ? "contents" : "none";
+        if (el._html !== html) { el.innerHTML = html; el._html = html; }
+        return el;
+      };
+      zone("head", head);
+
+      const formulaire = d.search && cfg.afficher_formulaire;
+      const formHtml = formulaire ? this._formHtml() : "";
+      const formSig = formulaire ? JSON.stringify([this._params, this._loading, this._res?.communes, this._res?.centre?.code_postal]) : "";
+      const zf = card.querySelector("#form");
+      const actif = this.shadowRoot.activeElement;
+      const saisie = actif && zf.contains(actif) && actif.tagName === "INPUT";
+      if (formSig !== this._formSig && !saisie) {
+        this._formSig = formSig;
+        zone("form", formHtml);
+        const form = zf.querySelector("form");
+        if (form) this._bindForm(form);
+      } else if (!formulaire) {
+        zone("form", "");
+      } else {
+        // Champ en cours de saisie : seul l'état du bouton est mis à jour.
+        const btn = zf.querySelector("button");
+        if (btn) { btn.disabled = !!this._loading; btn.textContent = this._loading ? "Recherche…" : "Rechercher"; }
+      }
+
+      let status = "";
+      if (d.search && this._err) status = `<div class="status err" role="alert">${esc(this._err)}</div>`;
+      else if (d.search && this._res?.centre && formulaire) {
+        const c = this._res.centre;
+        status = `<div class="status">Autour de ${esc(titre(c.libelle))}${c.code_postal ? ` (${esc(c.code_postal)})` : ""} · ${esc(this._res.rayon_km)} km · ${esc((DON[this._res.type_don] || "").toLowerCase())} · ${esc(this._res.horizon_jours)} jours${this._loading ? " · actualisation…" : ""}</div>`;
+      }
+      zone("status", status);
+      zone("body", body);
     }
 
     _synthese(d, f) {
@@ -351,7 +625,7 @@
       const max = Math.max(1, Number(cfg.max) || 6);
       const rows = d.list.slice(0, max);
       const head = `<div class="row" style="align-items:baseline"><span class="h">Collectes à venir</span>
-        <span class="muted small">${esc(d.list.length)} · ${esc(d.rayon)} km · ${esc(cfg.jours || d.G.horizon_jours || "")} jours</span></div>`;
+        <span class="muted small">${esc(d.list.length)} · ${esc(d.rayon)} km · ${esc(d.jours || "")} jours</span></div>`;
       if (!rows.length) return head + `<div class="empty">${this._vide(d)}</div>`;
       const items = rows.map((c) => {
         const lien = safeUrl(c.lien_rdv);
@@ -368,7 +642,8 @@
           <div class="st">${right}</div></li>`;
       }).join("");
       const reste = d.list.length - rows.length;
-      const plus = cfg.afficher_pied && reste > 0 ? `<div class="muted xs">+ ${reste} autre${reste > 1 ? "s" : ""} collecte${reste > 1 ? "s" : ""} (calendrier « Collectes »)</div>` : "";
+      const ou = d.search ? "augmentez « Nombre de lignes »" : "calendrier « Collectes »";
+      const plus = cfg.afficher_pied && reste > 0 ? `<div class="muted xs">+ ${reste} autre${reste > 1 ? "s" : ""} collecte${reste > 1 ? "s" : ""} (${ou})</div>` : "";
       return head + `<ul class="agenda">${items}</ul>` + plus;
     }
 
@@ -483,18 +758,38 @@
     afficher_plan: "Plan des lieux",
     afficher_jauge: "Jauge de remplissage",
     afficher_remplissage: "Places réservées par collecte",
+    code_postal: "Code postal du point de départ",
+    commune_depart: "Commune de départ (facultatif)",
+    rayon_km: "Rayon d’action",
+    type_don: "Type de collecte",
+    inclure_professionnelles: "Inclure les collectes en entreprise / établissement scolaire",
+    afficher_formulaire: "Champs de recherche modifiables dans la carte",
+    actualisation: "Actualisation (minutes)",
   };
+  // Libellés qui changent de sens en mode recherche.
+  const LABELS_RECHERCHE = { jours: "Nombre de jours (à partir d’aujourd’hui)" };
   const HELPERS = {
     entity: "N’importe quelle entité de l’instance ; vide = première instance trouvée.",
     commune: "Choisissez une commune pour présenter sa prochaine collecte plutôt que la plus proche dans le temps. Vous pouvez aussi saisir un nom.",
     jours: "Vide = horizon de l’intégration.",
     distance_max: "Vide = rayon de l’intégration ; ne peut pas l’élargir.",
     max: "La liste reçue de l’intégration est plafonnée par son réglage « Nombre maximum de collectes listées ».",
+    code_postal: "Renseigné, la carte fait sa propre recherche (rayon, type, jours ci-dessous) et n’utilise plus d’instance. Vide = instance choisie plus haut.",
+    commune_depart: "Nom ou code INSEE, si le code postal couvre plusieurs communes (défaut : la première par ordre alphabétique).",
+    afficher_formulaire: "Permet de changer le code postal, le rayon, le type et le nombre de jours depuis la carte, sans modifier sa configuration.",
+    actualisation: "Les réponses sont mises en cache 15 min par l’intégration.",
   };
+  const HELPERS_RECHERCHE = { jours: "Défaut : 30 jours." };
 
   /** Communes des collectes à venir de l'instance, avec leurs dates, pour la liste de l'éditeur. */
   function communesDe(hass, cfg) {
     if (!hass) return [];
+    const choisie0 = cfg.commune && cfg.commune !== COMMUNE_AUTO ? cfg.commune : null;
+    if (cfg.code_postal || cfg.afficher_formulaire) {
+      // Recherche propre à la carte : les communes dépendent de la réponse, saisie libre.
+      return [{ value: COMMUNE_AUTO, label: "Prochaine collecte (la plus proche dans le temps)" },
+        ...(choisie0 ? [{ value: choisie0, label: titre(choisie0) }] : [])];
+    }
     const { agenda } = resolveInstance(hass, cfg);
     const list = hass.states?.[agenda]?.attributes?.collectes || [];
     const fmt = new Intl.DateTimeFormat("fr-FR", { timeZone: hass.config?.time_zone || TZ_FALLBACK, day: "2-digit", month: "2-digit" });
@@ -518,7 +813,7 @@
     return [{ value: COMMUNE_AUTO, label: "Prochaine collecte (la plus proche dans le temps)" }, ...options];
   }
 
-  function editorSchema(vue, communes) {
+  function editorSchema(vue, communes, recherche) {
     const syn = vue === "synthese" || vue === "complet";
     const ag = vue === "agenda" || vue === "complet";
     const ca = vue === "carte" || vue === "complet";
@@ -531,8 +826,27 @@
       ca && { name: "afficher_jauge", selector: { boolean: {} } },
       ca && { name: "afficher_remplissage", selector: { boolean: {} } },
     ].filter(Boolean);
+    const jours = { name: "jours", selector: { number: { min: 1, max: 180, mode: "box", unit_of_measurement: "j" } } };
+    const sectionRecherche = {
+      type: "expandable", name: "", title: "Recherche (point de départ, rayon, type, jours)", icon: "mdi:map-search-outline",
+      flatten: true, expanded: recherche,
+      schema: [
+        { type: "grid", name: "", schema: [
+          { name: "code_postal", selector: { text: {} } },
+          recherche && { name: "commune_depart", selector: { text: {} } },
+        ].filter(Boolean) },
+        recherche && { type: "grid", name: "", schema: [
+          { name: "rayon_km", selector: { number: { min: 1, max: 50, mode: "box", unit_of_measurement: "km" } } },
+          jours,
+        ] },
+        recherche && { name: "type_don", selector: { select: { mode: "dropdown", options: Object.entries(DON).map(([value, label]) => ({ value, label })) } } },
+        recherche && { name: "inclure_professionnelles", selector: { boolean: {} } },
+        { name: "afficher_formulaire", selector: { boolean: {} } },
+        recherche && { name: "actualisation", selector: { number: { min: 5, max: 360, mode: "box", unit_of_measurement: "min" } } },
+      ].filter(Boolean),
+    };
     return [
-      { name: "entity", selector: { entity: { filter: [{ integration: DOMAIN, domain: "sensor" }] } } },
+      !recherche && { name: "entity", selector: { entity: { filter: [{ integration: DOMAIN, domain: "sensor" }] } } },
       {
         name: "vue", required: true,
         selector: { select: { mode: "dropdown", options: [
@@ -547,6 +861,7 @@
         selector: { select: { mode: "dropdown", custom_value: true, options: communes } },
       },
       { name: "titre", selector: { text: {} } },
+      sectionRecherche,
       {
         type: "expandable", name: "", title: "Filtres", icon: "mdi:filter-variant", flatten: true,
         schema: [
@@ -555,9 +870,9 @@
             { value: "rdv_ouverts", label: "Seulement celles où l’on peut prendre rendez-vous" },
           ] } } },
           { type: "grid", name: "", schema: [
-            { name: "jours", selector: { number: { min: 1, max: 180, mode: "box", unit_of_measurement: "j" } } },
+            !recherche && jours,
             { name: "distance_max", selector: { number: { min: 1, max: 50, mode: "box", unit_of_measurement: "km" } } },
-          ] },
+          ].filter(Boolean) },
           { name: "max", selector: { number: { min: 1, max: 30, mode: "slider" } } },
         ],
       },
@@ -605,8 +920,9 @@
       if (!this._config) return;
       if (!this._form) {
         this._form = document.createElement("ha-form");
-        this._form.computeLabel = (s) => LABELS[s.name] ?? s.title ?? s.name;
-        this._form.computeHelper = (s) => HELPERS[s.name];
+        const rech = () => Boolean(this._config?.code_postal || this._config?.afficher_formulaire);
+        this._form.computeLabel = (s) => (rech() && LABELS_RECHERCHE[s.name]) || LABELS[s.name] || s.title || s.name;
+        this._form.computeHelper = (s) => (rech() && HELPERS_RECHERCHE[s.name]) || HELPERS[s.name];
         this._form.addEventListener("value-changed", (ev) => this._changed(ev.detail.value));
         this.replaceChildren(this._form);
       }
@@ -618,7 +934,7 @@
       this._form.data = data;
       const communes = communesDe(this._hass, this._config);
       this._communesSig = JSON.stringify(communes);
-      this._form.schema = editorSchema(data.vue, communes);
+      this._form.schema = editorSchema(data.vue, communes, Boolean(data.code_postal || data.afficher_formulaire));
     }
 
     _changed(value) {
@@ -644,7 +960,7 @@
     window.customCards.push({
       type: "efs-collectes-card",
       name: "EFS – Collectes de don du sang",
-      description: "Prochaine collecte, agenda, plan et remplissage, avec filtres et choix des éléments affichés.",
+      description: "Prochaine collecte, agenda, plan et remplissage, pour une instance ou une recherche propre à la carte (code postal, rayon, type de collecte, nombre de jours).",
       preview: true,
       documentationURL: "https://github.com/Laurent14760/HomeAssistant_DonduSang_Card",
     });
