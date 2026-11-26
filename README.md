@@ -24,7 +24,7 @@ Depuis la 1.3.0, la carte peut aussi faire **sa propre recherche** à partir d�
 ### Manuelle
 
 1. Copier `dist/efs-collectes-card.js` dans `/config/www/efs-collectes-card.js`.
-2. Paramètres → Tableaux de bord → ⋮ → **Ressources** → **Ajouter une ressource** : URL `/local/efs-collectes-card.js?v=1.3.0`, type **Module JavaScript**.
+2. Paramètres → Tableaux de bord → ⋮ → **Ressources** → **Ajouter une ressource** : URL `/local/efs-collectes-card.js?v=1.3.1`, type **Module JavaScript**.
 3. Recharger la page (et vider le cache de l’application mobile). À chaque mise à jour manuelle, incrémenter le `?v=` pour forcer le rechargement.
 
 ## Utilisation
@@ -60,9 +60,11 @@ Dès qu’un **code postal** est indiqué (section « Recherche » de l’édite
 |---|---|---|---|
 | Code postal du point de départ | `code_postal` | aucun | Active la recherche propre à la carte. Écrire `"01000"` entre guillemets pour les codes commençant par 0 (la carte rattrape aussi `1000`) |
 | Commune de départ | `commune_depart` | 1re par ordre alphabétique | Nom ou code INSEE, quand le code postal couvre plusieurs communes (14760 : Bretteville-l’Orgueilleuse, Bretteville-sur-Odon…) |
-| Rayon d’action | `rayon_km` | `10` | De 1 à 50 km autour du centre de la commune |
+| Rayon d’action | `rayon_km` | `10` | De 0 à 50 km autour du centre de la commune. **0 = uniquement les collectes de la commune de départ** (intégration 1.4.1 ou plus) |
 | Type de collecte | `type_don` | `sang` | `sang`, `plasma` ou `plaquettes` : places, statut et lien de rendez-vous propres à ce type |
 | Nombre de jours | `jours` | `30` | De 1 à 180 jours à partir d’aujourd’hui (en mode instance, `jours` reste un simple filtre) |
+
+Une valeur hors bornes (rayon hors de 0–50 km, jours hors de 1–180) est signalée : erreur de configuration dans l’éditeur, message sous le formulaire de la carte. Elle n’est jamais remplacée sans le dire.
 | Inclure les collectes en entreprise / établissement scolaire | `inclure_professionnelles` | non | Souvent réservées au personnel ou aux élèves |
 | Champs de recherche modifiables dans la carte | `afficher_formulaire` | non | Affiche code postal, rayon, type, jours (et commune si besoin) en tête de carte ; sans code postal configuré, la carte attend une saisie |
 | Actualisation | `actualisation` | `30` min | Fréquence de relance de la recherche tant que la carte est affichée (minimum 5 min) |
@@ -86,6 +88,15 @@ afficher_formulaire: true
 code_postal: "14760"      # valeur proposée à l’ouverture (facultatif)
 rayon_km: 10
 jours: 30
+```
+
+Seulement les collectes de la commune (ex. Bretteville-sur-Odon, sans les communes voisines) :
+
+```yaml
+type: custom:efs-collectes-card
+code_postal: "14760"
+rayon_km: 0
+jours: 60
 ```
 
 Points à connaître :

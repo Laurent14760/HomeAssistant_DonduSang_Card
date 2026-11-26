@@ -11,7 +11,7 @@
  *   entity: sensor.efs_caen_collectes_a_venir   # n'importe quelle entité de l'instance (défaut : 1re instance)
  *   # --- recherche propre à la carte (remplace l'instance) ---
  *   code_postal: "14760"   commune_depart: Bretteville-sur-Odon   # commune : si le code postal en couvre plusieurs
- *   rayon_km: 10           type_don: sang | plasma | plaquettes
+ *   rayon_km: 10 (0 = uniquement la commune de départ)   type_don: sang | plasma | plaquettes
  *   jours: 30              # recherche : nombre de jours couverts ; instance : filtre sur l'horizon
  *   inclure_professionnelles: false   actualisation: 30 (minutes)
  *   afficher_formulaire: true          # champs de recherche modifiables directement dans la carte
@@ -25,7 +25,7 @@
  *   afficher_plan / afficher_jauge / afficher_remplissage : true | false
  */
 (() => {
-  const VERSION = "1.3.0";
+  const VERSION = "1.3.1";
   const DOMAIN = "efs_dondesang";
   const TZ_FALLBACK = "Europe/Paris";
   const DON = { sang: "Sang total", plasma: "Plasma", plaquettes: "Plaquettes" };
@@ -46,11 +46,24 @@
   const SERVICE = "rechercher_collectes";
   const JOURS_RECHERCHE = 30;       // nombre de jours par défaut d'une recherche
   const MAX_RECHERCHE = 50;         // collectes demandées (la vue synthèse peut viser une commune lointaine)
-  const BORNES = { rayon_km: [1, 50], jours: [1, 180] };
+  // Rayon 0 = collectes de la commune de départ uniquement (intégration 1.4.1 ou plus).
+  const BORNES = { rayon_km: [0, 50], jours: [1, 180] };
+  const MSG_BORNES = {
+    rayon_km: "Le rayon doit être compris entre 0 (commune de départ uniquement) et 50 km.",
+    jours: "Le nombre de jours doit être compris entre 1 et 180.",
+  };
+  /** Message d'erreur si la valeur est renseignée mais hors bornes (ou non numérique), sinon null. */
+  const horsBornes = (v, cle) => {
+    if (v === undefined || v === null || v === "") return null;
+    const n = Number(v);
+    const [min, max] = BORNES[cle];
+    return Number.isFinite(n) && n >= min && n <= max ? null : MSG_BORNES[cle];
+  };
   const CP_RE = /^\d{5}$/;
   const borne = (v, [min, max], def) => {
+    if (v === undefined || v === null || v === "") return def;
     const n = Number(v);
-    return Number.isFinite(n) && n > 0 ? Math.max(min, Math.min(max, Math.round(n))) : def;
+    return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.round(n))) : def;
   };
 
   const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) =>
@@ -212,6 +225,13 @@
     setConfig(config) {
       if (config.vue && !VUES.includes(config.vue)) throw new Error(`vue doit valoir : ${VUES.join(", ")}`);
       if (config.type_don && !(config.type_don in DON)) throw new Error(`type_don doit valoir : ${Object.keys(DON).join(", ")}`);
+      // En recherche, un rayon ou un nombre de jours hors bornes est signalé au lieu d'être remplacé.
+      if (config.code_postal || config.afficher_formulaire) {
+        for (const k of ["rayon_km", "jours"]) {
+          const err = horsBornes(config[k], k);
+          if (err) throw new Error(`${k} : ${err}`);
+        }
+      }
       this._config = { ...DEFAULTS, ...config };
       this._ids = null;
       if (!this.shadowRoot) this.attachShadow({ mode: "open" });
@@ -363,7 +383,7 @@
       return `<form class="search" novalidate>
         <label>Code postal<input name="code_postal" inputmode="numeric" autocomplete="postal-code" maxlength="5" placeholder="14000"
           value="${esc(p.code_postal)}" aria-invalid="${invalide}"></label>
-        <label>Rayon (km)<input name="rayon_km" type="number" min="${BORNES.rayon_km[0]}" max="${BORNES.rayon_km[1]}" value="${esc(p.rayon_km)}"></label>
+        <label>Rayon (km, 0 = commune)<input name="rayon_km" type="number" min="${BORNES.rayon_km[0]}" max="${BORNES.rayon_km[1]}" value="${esc(p.rayon_km)}"></label>
         <label>Type de collecte<select name="type_don">${Object.entries(DON).map(([k, l]) => opt(k, l, k === p.type_don)).join("")}</select></label>
         <label>Jours<input name="jours" type="number" min="${BORNES.jours[0]}" max="${BORNES.jours[1]}" value="${esc(p.jours)}"></label>
         <button type="submit"${this._loading ? " disabled" : ""}>${this._loading ? "Recherche…" : "Rechercher"}</button>
@@ -376,6 +396,20 @@
         const v = Object.fromEntries(new FormData(form).entries());
         const cp = String(v.code_postal || "").replace(/\s/g, "");
         const autreCp = cp !== this._params.code_postal;
+        // Valeur hors bornes : signalée sous le formulaire, aucune recherche lancée.
+        const erreurs = [];
+        for (const k of ["rayon_km", "jours"]) {
+          const err = horsBornes(v[k], k);
+          form[k].setAttribute("aria-invalid", String(Boolean(err)));
+          if (err) erreurs.push(err);
+        }
+        if (cp && !CP_RE.test(cp)) erreurs.unshift("Le code postal doit comporter 5 chiffres.");
+        this._formErr = erreurs.join(" ") || null;
+        if (erreurs.length) {
+          form.code_postal.setAttribute("aria-invalid", String(Boolean(cp) && !CP_RE.test(cp)));
+          this._render();
+          return false;
+        }
         this._params = {
           ...this._params,
           code_postal: cp,
@@ -454,7 +488,9 @@
         tz, next, ag, A, G, list, toutes, search,
         total: search ? num(G.nombre) ?? toutes.length : toutes.length,
         filtre_actif: list.length !== toutes.length,
-        rayon: dmax || num(G.rayon_km) || 10,
+        // Rayon 0 (commune seule) : le plan est cadré sur la collecte la plus éloignée.
+        commune_seule: search && (G.perimetre === "commune" || num(G.rayon_km) === 0),
+        rayon: dmax || num(G.rayon_km) || Math.max(2, Math.ceil(Math.max(0, ...toutes.map((c) => c.distance || 0)))),
         jours: search ? G.horizon_jours : cfg.jours || G.horizon_jours,
       };
     }
@@ -478,11 +514,17 @@
       return n <= 0 ? "aujourd’hui" : n === 1 ? "demain" : `dans ${n} jours`;
     }
 
+    /** Libellé du périmètre : « 10 km » ou « Bretteville-sur-Odon seulement ». */
+    _perimetre(d) {
+      return d.commune_seule ? `${titre(d.G.centre?.libelle || "commune de départ")} seulement` : `${d.rayon} km`;
+    }
+
     _vide(d) {
       const c = this._config;
       if (d.filtre_actif) return "Aucune collecte ne correspond aux filtres de la carte.";
       const autour = d.search && d.G.centre?.libelle ? ` de ${esc(titre(d.G.centre.libelle))}` : "";
       const type = d.search ? ` (${esc((DON[d.G.type_don] || "").toLowerCase())})` : "";
+      if (d.commune_seule) return `Aucune collecte${type} à ${esc(titre(d.G.centre?.libelle || ""))} dans les ${esc(d.jours || "")} prochains jours.`;
       return `Aucune collecte${type} dans les ${esc(d.jours || "")} prochains jours à moins de ${esc(d.rayon)} km${autour}.`;
     }
 
@@ -555,10 +597,11 @@
       }
 
       let status = "";
-      if (d.search && this._err) status = `<div class="status err" role="alert">${esc(this._err)}</div>`;
+      if (formulaire && this._formErr) status = `<div class="status err" role="alert">${esc(this._formErr)}</div>`;
+      else if (d.search && this._err) status = `<div class="status err" role="alert">${esc(this._err)}</div>`;
       else if (d.search && this._res?.centre && formulaire) {
         const c = this._res.centre;
-        status = `<div class="status">Autour de ${esc(titre(c.libelle))}${c.code_postal ? ` (${esc(c.code_postal)})` : ""} · ${esc(this._res.rayon_km)} km · ${esc((DON[this._res.type_don] || "").toLowerCase())} · ${esc(this._res.horizon_jours)} jours${this._loading ? " · actualisation…" : ""}</div>`;
+        status = `<div class="status">Autour de ${esc(titre(c.libelle))}${c.code_postal ? ` (${esc(c.code_postal)})` : ""} · ${esc(this._perimetre(d))} · ${esc((DON[this._res.type_don] || "").toLowerCase())} · ${esc(this._res.horizon_jours)} jours${this._loading ? " · actualisation…" : ""}</div>`;
       }
       zone("status", status);
       zone("body", body);
@@ -610,7 +653,7 @@
         : "";
       const pied = cfg.afficher_pied && (maj || autres || A.api_disponible === false)
         ? `<div class="row muted xs foot"><span>${esc(maj)}${A.api_disponible === false ? " · API indisponible, données conservées" : ""}</span>
-            <span>${autres ? `${autres} autre${autres > 1 ? "s" : ""} collecte${autres > 1 ? "s" : ""} dans ${esc(d.rayon)} km` : ""}</span></div>`
+            <span>${autres ? `${autres} autre${autres > 1 ? "s" : ""} collecte${autres > 1 ? "s" : ""} ${d.commune_seule ? "dans la commune" : `dans ${esc(d.rayon)} km`}` : ""}</span></div>`
         : "";
       return `${entete}
         ${remplacee}
@@ -625,7 +668,7 @@
       const max = Math.max(1, Number(cfg.max) || 6);
       const rows = d.list.slice(0, max);
       const head = `<div class="row" style="align-items:baseline"><span class="h">Collectes à venir</span>
-        <span class="muted small">${esc(d.list.length)} · ${esc(d.rayon)} km · ${esc(d.jours || "")} jours</span></div>`;
+        <span class="muted small">${esc(d.list.length)} · ${esc(this._perimetre(d))} · ${esc(d.jours || "")} jours</span></div>`;
       if (!rows.length) return head + `<div class="empty">${this._vide(d)}</div>`;
       const items = rows.map((c) => {
         const lien = safeUrl(c.lien_rdv);
@@ -705,7 +748,7 @@
           <text class="map-label" x="${(right ? x + 14 : x - 14).toFixed(1)}" y="${ly.toFixed(1)}" text-anchor="${right ? "start" : "end"}">${esc(label)}</text></a>`;
       }
       const dot = (cls) => `<svg width="12" height="12" aria-hidden="true"><circle cx="6" cy="6" r="4.5" class="${cls}"/></svg>`;
-      return `<div class="row" style="align-items:baseline"><span class="h">Collectes dans un rayon de ${esc(R)} km</span><span class="muted small">${lieux.size} lieu${lieux.size > 1 ? "x" : ""}</span></div>
+      return `<div class="row" style="align-items:baseline"><span class="h">${d.commune_seule ? `Collectes à ${esc(titre(centre.libelle))}` : `Collectes dans un rayon de ${esc(R)} km`}</span><span class="muted small">${lieux.size} lieu${lieux.size > 1 ? "x" : ""}</span></div>
         <svg class="map" viewBox="0 0 ${W} ${H}" role="img" aria-label="Carte des collectes dans un rayon de ${R} km autour de ${esc(centre.libelle || "")}">
         <rect class="map-bg" x="0" y="0" width="${W}" height="${H}"/>${grid}
         <circle class="map-circle" cx="${CX}" cy="${CY}" r="${RPX}"/>
@@ -774,6 +817,7 @@
     jours: "Vide = horizon de l’intégration.",
     distance_max: "Vide = rayon de l’intégration ; ne peut pas l’élargir.",
     max: "La liste reçue de l’intégration est plafonnée par son réglage « Nombre maximum de collectes listées ».",
+    rayon_km: "0 = uniquement les collectes de la commune de départ (intégration 1.4.1 ou plus).",
     code_postal: "Renseigné, la carte fait sa propre recherche (rayon, type, jours ci-dessous) et n’utilise plus d’instance. Vide = instance choisie plus haut.",
     commune_depart: "Nom ou code INSEE, si le code postal couvre plusieurs communes (défaut : la première par ordre alphabétique).",
     afficher_formulaire: "Permet de changer le code postal, le rayon, le type et le nombre de jours depuis la carte, sans modifier sa configuration.",
@@ -836,7 +880,7 @@
           recherche && { name: "commune_depart", selector: { text: {} } },
         ].filter(Boolean) },
         recherche && { type: "grid", name: "", schema: [
-          { name: "rayon_km", selector: { number: { min: 1, max: 50, mode: "box", unit_of_measurement: "km" } } },
+          { name: "rayon_km", selector: { number: { min: 0, max: 50, mode: "box", unit_of_measurement: "km" } } },
           jours,
         ] },
         recherche && { name: "type_don", selector: { select: { mode: "dropdown", options: Object.entries(DON).map(([value, label]) => ({ value, label })) } } },
